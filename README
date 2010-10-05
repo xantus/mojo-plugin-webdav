@@ -1,3 +1,5 @@
 
 WebDAV plugin for Mojolicious
 
+
+Tested using litmus-0.12.1

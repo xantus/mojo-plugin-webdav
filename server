@@ -1,0 +1,59 @@
+#!/usr/bin/perl
+
+# http://github.com/kraih/mojo
+use lib ( 'mojo/lib', 'lib' );
+
+# http://mojolicio.us/
+use Mojolicious::Lite;
+
+my $config = plugin json_config => {
+    file => 'server.conf',
+
+    # Don't edit this; edit server.conf instead ( these are the defaults )
+    default => {
+        listen => 'http://*:3000',
+        pid_file => '.server.pid',
+        doc_root => 'public',
+        keep_alive_timeout => 30,
+        client_timeout => 25, # lower than keep alive timeout
+    }
+};
+
+# resolve full paths
+$config->{"_$_"} = app->home->rel_dir( $config->{$_} ) foreach (qw( doc_root pid_file ));
+
+# windows sucks
+unlink( $config->{_pid_file} ) if ( !@ARGV && $^O eq 'Win32' );
+
+# set the applications dir as the HttpDoc dir
+app->static->root( $config->{_doc_root} );
+app->client->keep_alive_timeout( $config->{keep_alive_timeout} );
+
+if ( $config->{content_types} ) {
+    while( my ( $k, $v ) = each %{$config->{content_types}} ) {
+        app->types->type( $k => $v );
+    }
+}
+
+@ARGV = ( 'daemon', '--listen='.$config->{listen} ) unless @ARGV;
+
+plugin 'webdav';
+
+get '/' => 'index';
+
+app->start;
+
+__DATA__
+
+@@ index.html.ep
+<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="Content-Type" content="text/html;charset=UTF-8" >
+    <title>Dav Server</title>
+</head>
+<body>
+    Dav Server
+</body>
+</html>
+
