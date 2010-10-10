@@ -65,7 +65,7 @@ sub _handle_req {
 
     if ( my $litmus = $c->req->headers->header( 'X-Litmus' ) ) {
         $c->app->log->debug( 'Litmus test request: '.$litmus );
-#        warn $c->req->to_string;
+        warn $c->req->to_string;
     }
 
     my $cmd = "cmd_". lc $c->req->method;
@@ -127,7 +127,7 @@ sub cmd_mkcol {
     my ( $self, $c, $path ) = @_;
 
     # 8.3.1
-    return $self->render_error( $c, 403 ) if -e $c->stash( 'dav.path' ) eq '/';
+    return $self->render_error( $c, 403 ) if $c->stash( 'dav.path' ) eq '/';
 
     return $self->render_error( $c, 415 ) if $c->req->headers->content_length;
 
@@ -288,7 +288,7 @@ sub cmd_options {
 sub cmd_propfind {
     my ( $self, $c ) = @_;
 
-    warn $c->req->to_string;
+#    warn $c->req->to_string;
 
     my $dom = $c->req->dom;
     my $ok = 0;
@@ -301,7 +301,7 @@ sub cmd_propfind {
                 last;
             }
             $ok = 1;
-            warn "children:".$child->name."\n";
+#            warn "children:".$child->name."\n";
         }
         $ok != -1;
     });
