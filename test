@@ -1,4 +1,4 @@
 #!/bin/sh
 cd litmus
-make URL=http://localhost:3000/files/ check
+make URL=http://localhost:3000/ check
 cd ..
