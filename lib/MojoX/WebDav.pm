@@ -486,7 +486,7 @@ sub cmd_propfind {
     }
 
     my $xml = $doc->toString(1);
-    warn $xml;
+#    warn $xml;
     $c->render_text( $xml, status => 207, format => 'xml' );
 }
 
