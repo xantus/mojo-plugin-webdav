@@ -15,7 +15,9 @@ my $config = plugin json_config => {
         pid_file => '.server.pid',
         doc_root => 'public',
         keep_alive_timeout => 30,
-        client_timeout => 25, # lower than keep alive timeout
+        dav_root => '/',           # relative to static
+        dav_prefix => '/',         # this prefix will be removed from the url
+        client_timeout => 25,
     }
 };
 
@@ -37,7 +39,10 @@ if ( $config->{content_types} ) {
 
 @ARGV = ( 'daemon', '--listen='.$config->{listen} ) unless @ARGV;
 
-plugin 'webdav';
+plugin 'webdav' => {
+    root => $config->{dav_root},
+    prefix => $config->{dav_prefix},
+};
 
 get '/' => 'index';
 
@@ -50,10 +55,9 @@ __DATA__
 <html>
 <head>
     <meta http-equiv="Content-Type" content="text/html;charset=UTF-8" >
-    <title>Dav Server</title>
+    <title></title>
 </head>
 <body>
-    Dav Server
 </body>
 </html>
 

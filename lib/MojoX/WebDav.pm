@@ -9,28 +9,29 @@ use Mojo::URL;
 use Mojo::Asset::File;
 use File::Copy::Recursive qw( rcopy rmove );
 use File::Path qw( mkpath rmtree );
-use File::Spec;
-use Data::Dumper;
+use File::Spec qw();
 use Mojo::ByteStream 'b';
-
-use Fcntl qw( O_RDWR O_CREAT S_ISDIR );
-use HTTP::Date qw( time2str time2isoz );
+use HTTP::Date qw();
+use Date::Format qw();
 use bytes;
 
-__PACKAGE__->attr( [qw/ mtfnpy prefix root /] );
-__PACKAGE__->attr( cfg     => sub { {} } );
+# I feel dirty
+use XML::LibXML;
+
+__PACKAGE__->attr( [qw/ mtfnpy /] );
 __PACKAGE__->attr( methods     => sub { [ qw( GET HEAD OPTIONS PROPFIND DELETE PUT COPY LOCK UNLOCK MOVE POST TRACE MKCOL ) ] } );
-__PACKAGE__->attr( allowed_methods => sub { join( ',', @{ shift->methods } ); });
+__PACKAGE__->attr( allowed_methods => sub { join( ',', @{ shift->methods } ) });
 
 sub register {
-    my ( $self, $app ) = @_;
+    my ( $self, $app, $config ) = @_;
 
-    return $self if $self->{configured}++;
-
-    $self->root( '/dav' );
-    $self->prefix( '/files' );
+    $config ||= {};
 
     $app->plugins->add_hook( before_dispatch => sub {
+        $_[1]->stash(
+            'dav.root' => $config->{root} || '/',
+            'dav.prefix' => $config->{prefix} || '/'
+        );
         $self->_handle_req( @_[ 1, $#_ ] );
     });
 
@@ -47,25 +48,30 @@ sub _handle_req {
 
     my $path = $c->req->url->path->clone->canonicalize->to_string;
 
+    $c->stash( 'dav.reqpath' => "$path" );
+
     # remove prefix
-    if ( my $prefix = $self->prefix ) {
+    if ( my $prefix = $c->stash( 'dav.prefix' ) ) {
         return unless $path =~ s/^$prefix//;
+        $path ||= '/';
     }
 
     $c->stash(
         'dav.request' => 1,
-        'dav.absroot' => File::Spec->catdir( $c->app->static->root, $self->root ),
-        'dav.root' => $self->root,
-        'dav.path' => $path,
-        'dav.prefix' => $self->prefix
+        # XXX revisit this
+        'dav.absroot' => File::Spec->catdir( $c->app->static->root, $c->stash( 'dav.root' ) ),
+        'dav.path'    => $path,
     );
 
     $c->res->headers->header( 'DAV' => '1,2,<http://apache.org/dav/propset/fs/1>' );
-    $c->res->headers->header( 'Vary' => 'Accept-Encoding' );
+    $c->res->headers->header( 'MS-Author-Via' => 'DAV' );
+#    $c->res->headers->header( 'Vary' => 'Accept-Encoding' );
 
     if ( my $litmus = $c->req->headers->header( 'X-Litmus' ) ) {
         $c->app->log->debug( 'Litmus test request: '.$litmus );
-        warn $c->req->to_string;
+        if ( $litmus eq 'props: 4 (propfind_d0)' ) {
+            warn $c->req->to_string;
+        }
     }
 
     my $cmd = "cmd_". lc $c->req->method;
@@ -73,10 +79,11 @@ sub _handle_req {
     if ( my $x = UNIVERSAL::can( $self, $cmd ) ) {
         my $parts = Mojo::Path->new->parse($path)->parts;
 
-        return $c->render_not_found if $parts->[0] eq '..';
+        return $c->render_not_found if $parts->[0] && $parts->[0] eq '..';
 
         my $abs_path = File::Spec->catfile( $c->stash( 'dav.absroot' ), @$parts );
-        $c->stash( 'dav.relpath' => File::Spec->catfile( $self->root, @$parts ) );
+        $c->stash( 'dav.rel' => File::Spec->catfile( @$parts ) || '/' );
+        $c->stash( 'dav.relpath' => File::Spec->catfile( $c->stash( 'dav.root' ), @$parts ) );
         $c->stash( 'dav.abspath' => $abs_path );
 
         $c->app->log->debug( "original path $path now, $abs_path" );
@@ -146,7 +153,7 @@ sub cmd_move {
     my $over = ( $c->req->headers->header( 'Overwrite' ) || '' ) eq 'T' ? 1 : 0;
 
 #    my $depth = $c->req->headers->header( 'Depth' );
-#    $depth = defined $depth && $depth == 0 ? 0 : 1;
+#    $depth = ( defined $depth && $depth =~ /^(0|1)$/ ) ? $1 : 'infinite';
 
     # 8.9.4
     return $c->render_error( $c, 403 ) if $path eq $dest;
@@ -192,7 +199,7 @@ sub cmd_copy {
 
     my $over = ( $c->req->headers->header( 'Overwrite' ) || '' ) eq 'T' ? 1 : 0;
     my $depth = $c->req->headers->header( 'Depth' );
-    $depth = defined $depth && $depth == 0 ? 0 : 1;
+    $depth = ( defined $depth && $depth =~ /^(0|1|infinite)$/ ) ? $1 : 'infinite';
 
     return $c->render_not_found unless -e $path;
 
@@ -205,7 +212,7 @@ sub cmd_copy {
     # are to be copied.
     #
     # A copy of "Depth: infinite" or undef copies the tree
-    if ( $depth == 0 ) {
+    if ( $depth eq '0' ) {
         return $self->render_error( $c, 409 ) if -d $dest;
         return $self->render_error( $c, 409 ) unless mkdir( $dest, 0755 );
 
@@ -280,35 +287,207 @@ sub cmd_options {
     $rsh->header( 'Content-Type'  => 'httpd/unix-directory' );
     $rsh->content_length( 0 );
     $c->res->code( 200 );
-    $c->res->body( '' );
+#    $c->res->body( '' );
     $c->rendered;
 }
 
-
 sub cmd_propfind {
-    my ( $self, $c ) = @_;
+    my ( $self, $c, $abspath ) = @_;
+    my $reqinfo = 'allprop';
+    my @reqprops;
 
-#    warn $c->req->to_string;
+    if ( $c->req->headers->content_length ) {
+        my $parser = eval { XML::LibXML->new->parse_string( $c->req->body ); };
+        return $self->render_error( $c, 400 ) if $@;
 
-    my $dom = $c->req->dom;
-    my $ok = 0;
-
-    $dom->find('prop')->until(sub {
-        foreach my $child ( @{ $_[0]->children } ) {
-            if ( $child->namespace eq '' ) {
-                # propfind_invalid2 - FAQ
-                $ok = -1;
-                last;
+        $reqinfo = $parser->find( '/*/*' )->shift->localname;
+        if ( $reqinfo eq 'prop' ) {
+            foreach my $node ( $parser->find( '/*/*/*' )->get_nodelist ) {
+                push( @reqprops, [ $node->namespaceURI, $node->localname ] );
             }
-            $ok = 1;
-#            warn "children:".$child->name."\n";
         }
-        $ok != -1;
-    });
+    }
 
-    return $self->render_error( $c, 400 ) if $ok != 1;
+    return $c->render_not_found unless -e $abspath;
 
-    return $self->render_error( $c, 500 );
+    my $depth = $c->req->headers->header( 'Depth' );
+    $depth = ( defined $depth && $depth =~ /^(0|1)$/ ) ? $1 : 'infinite';
+
+    my $doc = XML::LibXML::Document->new( '1.0', 'utf-8' );
+    my $multistat = $doc->createElement( 'D:multistatus' );
+    $multistat->setAttribute( 'xmlns:D', 'DAV:' );
+    $doc->setDocumentElement( $multistat );
+
+    my @paths;
+    if ( $depth eq '1' and -d $abspath ) {
+        opendir( my $dir, $abspath );
+        #@paths = File::Spec->no_upwards( grep { !/^\./ } readdir $dir );
+        @paths = File::Spec->no_upwards( readdir $dir );
+        closedir( $dir );
+        push( @paths, $c->stash( 'dav.rel' ) );
+    } else {
+        @paths = ( $c->stash( 'dav.rel' ) );
+    }
+
+    my $root = $c->stash( 'dav.absroot' );
+    foreach my $rel ( @paths ) {
+        my $path = File::Spec->catdir( $root, $rel );
+        my ( $size, $mtime, $ctime ) = ( stat( $path ) )[ 7, 9, 10 ];
+
+        # modified time is stringified human readable HTTP::Date style
+        $mtime = HTTP::Date::time2str($mtime);
+
+        $ctime = Date::Format::time2str( '%Y-%m-%dT%H:%M:%S', $ctime );
+        $size ||= '';
+
+        my $resp = $doc->createElement( 'D:response' );
+        $multistat->addChild( $resp );
+        my $href = $doc->createElement( 'D:href' );
+        my $uri = File::Spec->catdir(
+            map { b( $_ )->url_escape->to_string } File::Spec->splitdir( $rel )
+        );
+        $uri .= '/' if -d $path && !$uri =~ m/\/$/;
+        $uri = '/'.$uri unless $uri =~ m/^\//;
+
+        $href->appendText( $uri );
+        $resp->addChild( $href );
+
+        my $okprops = $doc->createElement( 'D:prop' );
+        my $badprops = $doc->createElement( 'D:prop' );
+        my $prop;
+
+        if ( $reqinfo eq 'prop' ) {
+            my $prefixes = { 'DAV:' => 'D' };
+            my $n = 'E';
+
+            foreach my $reqprop ( @reqprops ) {
+                my ($ns, $name) = @$reqprop;
+                if ( $ns eq 'DAV:' && $name eq 'creationdate' ) {
+                    $prop = $doc->createElement( 'D:creationdate' );
+                    $prop->appendText( $ctime );
+                    $okprops->addChild( $prop );
+                } elsif ( $ns eq 'DAV:' && $name eq 'getcontentlength' ) {
+                    $prop = $doc->createElement( 'D:getcontentlength' );
+                    $prop->appendText( $size );
+                    $okprops->addChild( $prop );
+                } elsif ( $ns eq 'DAV:' && $name eq 'getcontenttype' ) {
+                    $prop = $doc->createElement( 'D:getcontenttype' );
+                    #$prop->appendText( 'httpd/unix-'.( -d $path ? 'directory' : 'file' ) );
+                    if ( -d $path ) {
+                        $prop->appendText( 'httpd/unix-directory' );
+                    } else {
+                        # crude
+                        my ( $ext ) = $path =~ m/\.([^\.]+)$/;
+                        if ( $ext ) {
+                            $prop->appendText( $c->app->types->type( lc $ext ) || 'httpd/unix-file' );
+                        } else {
+                           $prop->appendText( 'httpd/unix-file' );
+                        }
+                    }
+                    $okprops->addChild( $prop );
+                } elsif ( $ns eq 'DAV:' && $name eq 'getlastmodified' ) {
+                    $prop = $doc->createElement( 'D:getlastmodified' );
+                    $prop->appendText( $mtime );
+                    $okprops->addChild( $prop );
+                } elsif ($ns eq 'DAV:' && $name eq 'resourcetype') {
+                    $prop = $doc->createElement( 'D:resourcetype' );
+                    $prop->addChild( $doc->createElement( 'D:collection' ) ) if -d $path;
+                    $okprops->addChild( $prop );
+                } else {
+                    my $prefix = $prefixes->{ $ns };
+                    unless ( defined $prefix ) {
+                        $prefix = "$n";
+
+                        # mod_dav sets <response> 'xmlns' attribute
+                        #$badprops->setAttribute("xmlns:$prefix", $ns);
+                        $resp->setAttribute("xmlns:$prefix", $ns);
+
+                        $prefixes->{ $ns } = $prefix;
+                        $n++;
+                    }
+
+                    $badprops->addChild( $doc->createElement( "$prefix:$name" ) );
+                }
+            }
+        } elsif ( $reqinfo eq 'propname' ) {
+            $okprops->addChild( $doc->createElement( 'D:creationdate' ) );
+            $okprops->addChild( $doc->createElement( 'D:getcontentlength' ) );
+            $okprops->addChild( $doc->createElement( 'D:getcontenttype' ) );
+            $okprops->addChild( $doc->createElement( 'D:getlastmodified' ) );
+            $okprops->addChild( $doc->createElement( 'D:resourcetype' ) );
+        } else {
+            $prop = $doc->createElement( 'D:creationdate' );
+            $prop->appendText( $ctime );
+            $okprops->addChild( $prop );
+
+            $prop = $doc->createElement( 'D:getcontentlength' );
+            $prop->appendText( $size );
+            $okprops->addChild( $prop );
+
+            $prop = $doc->createElement( 'D:getcontenttype' );
+            #$prop->appendText( 'httpd/unix-'.( -d $path ? 'directory' : 'file' ) );
+            if ( -d $path ) {
+                $prop->appendText( 'httpd/unix-directory' );
+            } else {
+                # crude
+                my ( $ext ) = $path =~ m/\.([^\.]+)$/;
+                if ( $ext ) {
+                    $prop->appendText( $c->app->types->type( lc $ext ) || 'httpd/unix-file' );
+                } else {
+                   $prop->appendText( 'httpd/unix-file' );
+                }
+            }
+            $okprops->addChild( $prop );
+
+            $prop = $doc->createElement( 'D:getlastmodified' );
+            $prop->appendText( $mtime );
+            $okprops->addChild( $prop );
+
+            $prop = $doc->createElement( 'D:supportedlock' );
+            foreach (qw( exclusive shared )) {
+                my $scope = $doc->createElement( 'D:lockscope' );
+                $scope->addChild( $doc->createElement( "D:$_" ) );
+                my $lock = $doc->createElement( 'D:lockentry' );
+                $lock->addChild($scope);
+
+                my $type = $doc->createElement( 'D:locktype' );
+                $type->addChild( $doc->createElement( 'D:write' ) );
+                $lock->addChild( $type );
+
+                $prop->addChild( $lock );
+            }
+            $okprops->addChild( $prop );
+
+            $prop = $doc->createElement( 'D:resourcetype' );
+            if ( -d $path ) {
+                my $col = $doc->createElement( 'D:collection' );
+                $prop->addChild( $col );
+            }
+            $okprops->addChild( $prop );
+        }
+
+        if ( $okprops->hasChildNodes ) {
+            my $propstat = $doc->createElement( 'D:propstat' );
+            $propstat->addChild( $okprops );
+            my $stat = $doc->createElement( 'D:status' );
+            $stat->appendText( 'HTTP/1.1 200 OK' );
+            $propstat->addChild( $stat );
+            $resp->addChild( $propstat );
+        }
+
+        if ( $badprops->hasChildNodes ) {
+            my $propstat = $doc->createElement( 'D:propstat' );
+            $propstat->addChild( $badprops );
+            my $stat = $doc->createElement( 'D:status' );
+            $stat->appendText( 'HTTP/1.1 404 Not Found' );
+            $propstat->addChild( $stat );
+            $resp->addChild( $propstat );
+        }
+    }
+
+    my $xml = $doc->toString(1);
+    warn $xml;
+    $c->render_text( $xml, status => 207, format => 'xml' );
 }
 
 sub cmd_get {
@@ -324,18 +503,14 @@ sub render_error {
 
     my $res = $c->res;
 
-    return if ($res->code || '') eq $code;
-    $res->code( $code );
+    return if ( $res->code || '' ) eq $code;
 
-    $res->headers->content_type('text/html');
-    $res->body(qq|
+    $c->render_text(qq|
 <!doctype html><html>
     <head><title>Error $code</title></head>
     <body><h2>Error $code</h2></body>
 </html>
-|);
-
-    return $c->rendered;
+|, status => $code, type => 'html' );
 }
 
 sub _get_dest {
@@ -362,4 +537,3 @@ sub _get_dest {
 }
 
 1;
-
