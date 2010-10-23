@@ -13,6 +13,7 @@ use File::Spec qw();
 use Mojo::ByteStream 'b';
 use HTTP::Date qw();
 use Date::Format qw();
+use Fcntl qw( O_WRONLY O_TRUNC O_CREAT );
 use bytes;
 
 # I feel dirty
@@ -28,7 +29,7 @@ sub register {
     $config ||= {};
 
     $app->plugins->add_hook( before_dispatch => sub {
-        $_[1]->stash(
+        $_[ 1 ]->stash(
             'dav.root' => $config->{root} || '/',
             'dav.prefix' => $config->{prefix} || '/'
         );
@@ -50,8 +51,11 @@ sub _handle_req {
 
     $c->stash( 'dav.reqpath' => "$path" );
 
+    my $cmd = "cmd_". lc $c->req->method;
+
     # remove prefix
     if ( my $prefix = $c->stash( 'dav.prefix' ) ) {
+        # handle this request?
         return unless $path =~ s/^$prefix//;
         $path ||= '/';
     }
@@ -65,16 +69,13 @@ sub _handle_req {
 
     $c->res->headers->header( 'DAV' => '1,2,<http://apache.org/dav/propset/fs/1>' );
     $c->res->headers->header( 'MS-Author-Via' => 'DAV' );
-#    $c->res->headers->header( 'Vary' => 'Accept-Encoding' );
 
     if ( my $litmus = $c->req->headers->header( 'X-Litmus' ) ) {
         $c->app->log->debug( 'Litmus test request: '.$litmus );
-        if ( $litmus eq 'props: 4 (propfind_d0)' ) {
-            warn $c->req->to_string;
-        }
+#        if ( $litmus eq 'props: 4 (propfind_d0)' ) {
+#            warn $c->req->to_string;
+#        }
     }
-
-    my $cmd = "cmd_". lc $c->req->method;
 
     if ( my $x = UNIVERSAL::can( $self, $cmd ) ) {
         my $parts = Mojo::Path->new->parse($path)->parts;
@@ -122,9 +123,13 @@ sub cmd_put {
         return $self->render_error( $c, 409 );
     }
 
-    my $asset = Mojo::Asset::File->new( path => $path );
-    $asset->add_chunk( $c->req->body );
-    $asset->cleanup(0);
+    sysopen( my $fh, $path, O_WRONLY|O_CREAT|O_TRUNC ) or die "Failed to open $path : $!";
+    syswrite( $fh, $c->req->body || '' );
+    close( $fh );
+
+#   my $asset = Mojo::Asset::File->new( path => $path );
+#   $asset->add_chunk( $c->req->body );
+#   $asset->cleanup(0);
 
     # created
     $c->render_text( 'Created', status => 201 );
@@ -179,7 +184,7 @@ sub cmd_move {
             unlink( $dest );
         }
         unless( rmove( $path, $dest ) ) {
-            warn "can't move $path to $dest : $!\n";
+            $c->app->log->error( "can't move $path to $dest : $!" );
             return $self->render_error( $c, 400 );
         }
         if ( $replaced ) {
@@ -242,7 +247,7 @@ sub cmd_copy {
 #            return $self->render_error( $c, 409 );
 #        }
         unless( rcopy( $path, $dest ) ) {
-            warn "can't copy $path to $dest : $!\n";
+            $c->app->log->error( "can't copy $path to $dest : $!" );
             return $self->render_error( $c, 400 );
         }
         if ( $replaced ) {
@@ -267,7 +272,7 @@ sub cmd_delete {
     } else {
         # 8.6.1
         unless ( unlink( $path ) ) {
-            warn "could not unlink $path, $!\n";
+            $c->app->log->error( "could not unlink $path, $!" );
             # permission denied
             return $self->render_error( $c, 403 );
         }
@@ -319,34 +324,39 @@ sub cmd_propfind {
     $doc->setDocumentElement( $multistat );
 
     my @paths;
-    if ( $depth eq '1' and -d $abspath ) {
+    # depth 0 is suppose to only return info on the dir
+    if ( ( $depth eq '0' || $depth eq '1' ) and -d $abspath ) {
         opendir( my $dir, $abspath );
         #@paths = File::Spec->no_upwards( grep { !/^\./ } readdir $dir );
         @paths = File::Spec->no_upwards( readdir $dir );
         closedir( $dir );
-        push( @paths, $c->stash( 'dav.rel' ) );
+        push( @paths, '/' ) if $depth eq '0';
     } else {
-        @paths = ( $c->stash( 'dav.rel' ) );
+        @paths = ( '/' );
     }
 
-    my $root = $c->stash( 'dav.absroot' );
     foreach my $rel ( @paths ) {
-        my $path = File::Spec->catdir( $root, $rel );
+        my $path = File::Spec->catdir( $abspath, $rel );
         my ( $size, $mtime, $ctime ) = ( stat( $path ) )[ 7, 9, 10 ];
 
         # modified time is stringified human readable HTTP::Date style
-        $mtime = HTTP::Date::time2str($mtime);
+#        $mtime = HTTP::Date::time2str($mtime);
+        $mtime = Date::Format::time2str( '%a, %d %b %Y %H:%M:%S %z', $mtime );
 
-        $ctime = Date::Format::time2str( '%Y-%m-%dT%H:%M:%S', $ctime );
+#        $ctime = Date::Format::time2str( '%Y-%m-%dT%H:%M:%S', $ctime );
+        $ctime = Date::Format::time2str( '%a, %d %b %Y %H:%M:%S %z', $ctime );
         $size ||= '';
 
         my $resp = $doc->createElement( 'D:response' );
         $multistat->addChild( $resp );
         my $href = $doc->createElement( 'D:href' );
         my $uri = File::Spec->catdir(
+            $c->stash( 'dav.prefix' ),
+            $c->stash( 'dav.rel' ),
             map { b( $_ )->url_escape->to_string } File::Spec->splitdir( $rel )
         );
-        $uri .= '/' if -d $path && !$uri =~ m/\/$/;
+        # XXX check if this works
+        $uri .= '/' if -d $path && $uri !~ m/\/$/;
         $uri = '/'.$uri unless $uri =~ m/^\//;
 
         $href->appendText( $uri );
@@ -364,6 +374,8 @@ sub cmd_propfind {
                 my ($ns, $name) = @$reqprop;
                 if ( $ns eq 'DAV:' && $name eq 'creationdate' ) {
                     $prop = $doc->createElement( 'D:creationdate' );
+                    $prop->setAttribute( 'xmlns:b', 'urn:uuid:c2f41010-65b3-11d1-a29f-00aa00c14882/' );
+                    $prop->setAttribute( 'b:dt', 'dateTime.rfc1123' );
                     $prop->appendText( $ctime );
                     $okprops->addChild( $prop );
                 } elsif ( $ns eq 'DAV:' && $name eq 'getcontentlength' ) {
@@ -387,6 +399,8 @@ sub cmd_propfind {
                     $okprops->addChild( $prop );
                 } elsif ( $ns eq 'DAV:' && $name eq 'getlastmodified' ) {
                     $prop = $doc->createElement( 'D:getlastmodified' );
+                    $prop->setAttribute( 'xmlns:b', 'urn:uuid:c2f41010-65b3-11d1-a29f-00aa00c14882/' );
+                    $prop->setAttribute( 'b:dt', 'dateTime.rfc1123' );
                     $prop->appendText( $mtime );
                     $okprops->addChild( $prop );
                 } elsif ($ns eq 'DAV:' && $name eq 'resourcetype') {
@@ -417,6 +431,8 @@ sub cmd_propfind {
             $okprops->addChild( $doc->createElement( 'D:resourcetype' ) );
         } else {
             $prop = $doc->createElement( 'D:creationdate' );
+            $prop->setAttribute( 'xmlns:b', 'urn:uuid:c2f41010-65b3-11d1-a29f-00aa00c14882/' );
+            $prop->setAttribute( 'b:dt', 'dateTime.rfc1123' );
             $prop->appendText( $ctime );
             $okprops->addChild( $prop );
 
@@ -440,6 +456,8 @@ sub cmd_propfind {
             $okprops->addChild( $prop );
 
             $prop = $doc->createElement( 'D:getlastmodified' );
+            $prop->setAttribute( 'xmlns:b', 'urn:uuid:c2f41010-65b3-11d1-a29f-00aa00c14882/' );
+            $prop->setAttribute( 'b:dt', 'dateTime.rfc1123' );
             $prop->appendText( $mtime );
             $okprops->addChild( $prop );
 
@@ -459,10 +477,7 @@ sub cmd_propfind {
             $okprops->addChild( $prop );
 
             $prop = $doc->createElement( 'D:resourcetype' );
-            if ( -d $path ) {
-                my $col = $doc->createElement( 'D:collection' );
-                $prop->addChild( $col );
-            }
+            $prop->addChild( $doc->createElement( 'D:collection' ) ) if -d $path;
             $okprops->addChild( $prop );
         }
 
@@ -485,9 +500,7 @@ sub cmd_propfind {
         }
     }
 
-    my $xml = $doc->toString(1);
-#    warn $xml;
-    $c->render_text( $xml, status => 207, format => 'xml' );
+    $c->render_text( $doc->toString(1), status => 207, format => 'xml' );
 }
 
 sub cmd_get {
